@@ -34,9 +34,7 @@ class AWSInstanceSelector:
 
         # Print summary of available instances
         print(f"Total instances: {len(self.df)}")
-        print(
-            f"Instances with valid prices: {
-                self.df['pricePerHour'].notna().sum()}")
+        print(f"Instances with valid prices: {self.df['pricePerHour'].notna().sum()}")
         print("Instance types available:", self.df['type'].unique())
 
     def _get_instance_type(self, api_name):
