@@ -17,10 +17,10 @@ class AWSInstanceSelector:
         self.df['memoryGiB'] = self.df['Instance Memory'].str.extract(
             r'(\d+\.?\d*)').astype(float)
 
-        # Extract numeric vCPU value
+        # Extract numeric vCPU value (ignore burst info)
         self.df['vCPU'] = self.df['vCPUs'].str.extract(r'(\d+)').astype(int)
 
-        # Clean price fields
+        # Clean price fields (remove "$" and "hourly", convert to float)
         self.df['pricePerHour'] = pd.to_numeric(
             self.df['On Demand'].str.extract(r'\$(\d+\.?\d*)')[0],
             errors='coerce'
@@ -32,16 +32,25 @@ class AWSInstanceSelector:
         # Clean up instance type for display
         self.df['instanceType'] = self.df['API Name']
 
+        # Print summary of available instances
+        print(f"Total instances: {len(self.df)}")
+        print(
+            f"Instances with valid prices: {
+                self.df['pricePerHour'].notna().sum()}")
+        print("Instance types available:", self.df['type'].unique())
+
     def _get_instance_type(self, api_name):
         """Determine instance type from API name"""
         if pd.isna(api_name) or not isinstance(api_name, str):
             return 'Unknown'
 
+        # Extract instance family (first character(s) before number)
         try:
             instance_family = api_name.split('.')[0].lower()
 
+            # Map common instance families to types
             type_mapping = {
-                't': 'BURST',
+                't': 'BURST',  # Changed to catch all T-series instances
                 'm': 'GENERAL',
                 'c': 'COMPUTE',
                 'r': 'MEMORY',
@@ -55,78 +64,32 @@ class AWSInstanceSelector:
                 'a': 'ARM'
             }
 
+            # Check if it's a metal instance
             if 'metal' in instance_family:
                 return 'METAL'
 
-            return type_mapping.get(instance_family[0], 'OTHER')
+            # Get the base type from the first letter
+            base_type = type_mapping.get(instance_family[0], 'OTHER')
+
+            return base_type
 
         except (AttributeError, IndexError):
             return 'Unknown'
 
-    def calculate_reliability_score(self, num_nodes):
-        """
-        Calculate reliability score based on node count and high-availability patterns
-
-        Reliability scoring logic:
-        1 node  = 0.4   (No HA, single point of failure)
-        2 nodes = 0.85  (Basic HA with primary/backup)
-        3 nodes = 1.0   (Optimal for consensus/quorum based systems)
-        4 nodes = 0.95  (Reduced score - doesn't improve quorum, wastes resources)
-        5 nodes = 0.98  (Slight improvement in failure tolerance)
-        6+ nodes = 0.90 (Diminishing returns, increased coordination overhead)
-
-        This follows common patterns where:
-        - Single node has no redundancy
-        - Two nodes provide basic failover but can't prevent split-brain
-        - Three nodes optimal for consensus (2n+1 for quorum)
-        - Four nodes don't improve quorum math over three
-        - Five nodes allow for two simultaneous failures
-        - Beyond five nodes provides minimal benefit for most use cases
-
-        Example use cases:
-        - Web servers behind load balancer: 2+ nodes optimal
-        - Database cluster: 3 nodes optimal (primary + 2 secondaries)
-        - Kafka/ZK: 3 or 5 nodes optimal for quorum
-        """
-        reliability_map = {
-            1: 0.4,   # No HA
-            2: 0.85,  # Basic HA
-            3: 1.0,   # Optimal quorum
-            4: 0.95,  # Suboptimal - doesn't improve quorum
-            5: 0.98,  # Improved failure tolerance
-        }
-        return reliability_map.get(num_nodes, 0.90)  # 6+ nodes
-
-    def get_optimal_combinations(
+    def calculate_node_combinations(
             self,
             target_memory,
             target_vcpu,
             max_nodes=5):
         """
-        Get optimal node combinations considering resources, cost, and reliability
-
-        Example:
-        Required: 32 GiB RAM, 8 vCPU
-
-        Possible combinations:
-        1. 1x r6g.2xlarge (32 GiB, 8 vCPU)
-           - Cost: $0.8064/hr
-           - Reliability: 0.4
-           - Utilization: 100% RAM, 100% CPU
-
-        2. 2x r6g.xlarge (16 GiB, 4 vCPU each)
-           - Cost: $0.4032/hr * 2 = $0.8064/hr
-           - Reliability: 0.85
-           - Utilization: 100% RAM, 100% CPU
-
-        3. 3x t3.large (8 GiB, 2 vCPU each)
-           - Cost: $0.0832/hr * 3 = $0.2496/hr
-           - Reliability: 1.0
-           - Utilization: 89% RAM, 89% CPU
+        Calculate possible node combinations that meet requirements while optimizing for cost
         """
         combinations = []
 
-        for instance_idx, instance in self.df.iterrows():
+        # Filter instances based on price availability
+        valid_instances = self.df[self.df['pricePerHour'].notna()].copy()
+
+        for _, instance in valid_instances.iterrows():
             for num_nodes in range(1, max_nodes + 1):
                 total_memory = instance['memoryGiB'] * num_nodes
                 total_vcpu = instance['vCPU'] * num_nodes
@@ -157,14 +120,22 @@ class AWSInstanceSelector:
 
         return pd.DataFrame(combinations)
 
+    def calculate_reliability_score(self, num_nodes):
+        """
+        Calculate reliability score based on node count and high-availability patterns
+        """
+        reliability_map = {
+            1: 0.4,   # No HA
+            2: 0.85,  # Basic HA
+            3: 1.0,
+            4: 0.95,
+            5: 0.98,  # Improved failure tolerance
+        }
+        return reliability_map.get(num_nodes, 0.90)  # 6+ nodes
+
     def score_combinations(self, combinations_df, weight_config=None):
         """
         Score combinations based on cost, utilization, and reliability
-
-        Default weights:
-        - Cost: 40% (primary driver)
-        - Resource Utilization: 35% (efficient use of resources)
-        - Reliability: 25% (HA consideration)
         """
         if weight_config is None:
             weight_config = {
@@ -178,7 +149,6 @@ class AWSInstanceSelector:
         cost_scores = min_cost / combinations_df['total_cost']
 
         # Calculate resource utilization score (closer to 100% is better)
-        # Penalize over-provisioning more than slight under-provisioning
         def score_utilization(util_pct):
             if util_pct > 100:
                 return 0  # Severely penalize under-provisioning
@@ -202,248 +172,40 @@ class AWSInstanceSelector:
 
         return final_scores
 
-    def calculate_mahalanobis_distance(self, target_memory, target_vcpu):
-        """
-        Calculate Mahalanobis distance to measure how many standard deviations a data point is from the mean
-        of our distribution, accounting for correlation between variables.
-
-        The Mahalanobis distance helps us identify optimal instances by considering both memory and vCPU
-        requirements simultaneously, while accounting for their relationship.
-
-        Example Covariance Matrix Calculation:
-        Consider these instances:
-        Instance   Memory(GiB)   vCPU
-        t3.small      2          2
-        t3.medium     4          2
-        t3.large      8          2
-        r6g.large     16         2
-
-        Memory mean = (2 + 4 + 8 + 16)/4 = 7.5
-        vCPU mean = (2 + 2 + 2 + 2)/4 = 2
-
-        Memory variance = mean((x - mean)²)
-            = ((2-7.5)² + (4-7.5)² + (8-7.5)² + (16-7.5)²)/4
-            = (30.25 + 12.25 + 0.25 + 72.25)/4
-            ≈ 28.75
-
-        vCPU variance = 0 (all instances have 2 vCPUs)
-
-        Covariance(memory,vcpu) = mean((memory - memory_mean)(vcpu - vcpu_mean))
-            = 0 (since vCPU doesn't vary)
-
-        Resulting covariance matrix:
-        [[ 28.75  0    ]    # This indicates:
-         [ 0      0    ]]   # - Memory variance = 28.75
-                            # - vCPU variance = 0
-                            # - No covariance (0) because vCPU doesn't vary
-
-        A more typical real-world example with varying vCPUs:
-        Instance   Memory(GiB)   vCPU
-        t3.small      2          2
-        t3.medium     4          2
-        r6g.large     16         4
-        r6g.xlarge    32         8
-
-        Now we'd see non-zero covariance because as memory increases,
-        vCPUs tend to increase too.
-        """
-        try:
-            features = self.df[['memoryGiB', 'vCPU']].values
-            target = np.array([target_memory, target_vcpu])
-
-            print(f"Features shape: {features.shape}")
-            print(f"Target values: {target}")
-
-            # Calculate covariance matrix
-            cov_matrix = np.cov(features.T)
-            print(f"Covariance matrix:\n{cov_matrix}")
-
-            # Add small regularization term to ensure matrix is invertible
-            epsilon = 1e-6
-            cov_matrix = cov_matrix + np.eye(2) * epsilon
-
-            # Inverse of covariance matrix
-            inv_covmat = np.linalg.inv(cov_matrix)
-            print(f"Inverse covariance matrix:\n{inv_covmat}")
-
-            # Calculate difference between each point and target
-            diff = features - target
-
-            # Calculate Mahalanobis distance
-            distances = np.sqrt(
-                np.sum(
-                    np.dot(
-                        diff,
-                        inv_covmat) *
-                    diff,
-                    axis=1))
-
-            print(f"Distance range: {distances.min()} to {distances.max()}")
-            return distances
-
-        except Exception as e:
-            print(f"Error in Mahalanobis calculation: {str(e)}")
-            return np.zeros(len(self.df))
-
-    def calculate_efficiency_score(
+    def get_optimal_combinations(
             self,
-            memory_weight=0.5,
-            target_memory=None,
-            target_vcpu=None):
+            target_memory,
+            target_vcpu,
+            max_nodes=5,
+            weight_config=None):
         """
-        Calculate efficiency score using statistical methods to provide more robust scoring.
-
-        We use chi-square distribution because Mahalanobis distance follows chi-square
-        distribution with degrees of freedom equal to number of variables (2 in our case:
-        memory and vCPU).
-
-        Args:
-            memory_weight (float): Weight for memory importance (0-1)
-            target_memory (float): Required memory in GiB
-            target_vcpu (int): Required vCPUs
-
-        Returns:
-            float: Final efficiency score (0-1)
+        Get optimal node combinations with detailed analysis
         """
-        try:
-            if target_memory is None or target_vcpu is None:
-                return 0
+        if weight_config is None:
+            weight_config = {
+                'cost': 0.40,
+                'resource_utilization': 0.35,
+                'reliability': 0.25
+            }
 
-            print(
-                f"\nCalculating efficiency score for target: {target_memory}GB, {target_vcpu} vCPUs")
-
-            # Calculate Mahalanobis distances
-            mahalanobis_dist = self.calculate_mahalanobis_distance(
-                target_memory, target_vcpu)
-
-            # Convert distances to probability scores
-            probability_scores = 1 - chi2.cdf(mahalanobis_dist, df=2)
-            print(
-                f"Probability scores range: {
-                    probability_scores.min():.4f} to {
-                    probability_scores.max():.4f}")
-
-            # Transform prices using log
-            cost_efficiency = -np.log(self.df['pricePerHour'] + 1e-10)
-            cost_efficiency = (cost_efficiency - cost_efficiency.min()) / \
-                (cost_efficiency.max() - cost_efficiency.min())
-            print(
-                f"Cost efficiency range: {
-                    cost_efficiency.min():.4f} to {
-                    cost_efficiency.max():.4f}")
-
-            # Calculate utilization ratios
-            memory_util = target_memory / self.df['memoryGiB']
-            vcpu_util = target_vcpu / self.df['vCPU']
-
-            def calculate_utilization_penalty(util):
-                return 1 - np.abs(1 - util)
-
-            # Combine utilization scores
-            utilization_score = (
-                calculate_utilization_penalty(memory_util) * memory_weight +
-                calculate_utilization_penalty(vcpu_util) * (1 - memory_weight)
-            )
-            print(
-                f"Utilization score range: {
-                    utilization_score.min():.4f} to {
-                    utilization_score.max():.4f}")
-
-            # Calculate final score
-            final_score = (
-                probability_scores ** 0.4 *     # Statistical fit
-                cost_efficiency ** 0.3 *        # Cost efficiency
-                utilization_score ** 0.3        # Resource utilization
-            )
-
-            print(
-                f"Final score range: {
-                    final_score.min():.4f} to {
-                    final_score.max():.4f}")
-
-            return final_score
-
-        except Exception as e:
-            print(f"Error in efficiency score calculation: {str(e)}")
-            return 0
-
-    def get_best_instances(
-            self,
-            memory_weight=0.5,
-            instance_types=None,
-            family_prefix=None,
-            required_memory=None,
-            required_vcpus=None,
-            max_instances=None,
-            top_n=5):
-        """
-        Get best instances based purely on scoring without filtering
-        """
-        print("\nStarting instance selection...")
-        print(
-            f"Requirements: {required_memory}GB memory, {required_vcpus} vCPUs")
-
-        # Create a working copy
-        working_df = self.df.copy()
-        print(f"Initial instances: {len(working_df)}")
-
-        # Filter out instances with unavailable pricing
-        working_df = working_df[working_df['pricePerHour'].notna()]
-        print(f"After price filtering: {len(working_df)}")
-
-        # Apply type filtering if specified
-        if instance_types:
-            working_df = working_df[working_df['type'].isin(instance_types)]
-            print(f"After type filtering: {len(working_df)}")
-
-        # Apply family prefix filtering if specified
-        if family_prefix:
-            working_df = working_df[working_df['API Name'].str.startswith(
-                family_prefix + '.', na=False)]
-            print(f"After family prefix filtering: {len(working_df)}")
-
-        if working_df.empty:
-            print("No instances available after filtering")
-            return pd.DataFrame()
-
-        # Calculate efficiency score
-        working_df['efficiency_score'] = self.calculate_efficiency_score(
-            memory_weight=memory_weight,
-            target_memory=required_memory,
-            target_vcpu=required_vcpus
+        # Get all possible combinations
+        combinations = self.calculate_node_combinations(
+            target_memory,
+            target_vcpu,
+            max_nodes
         )
 
-        # Print some debugging info
-        print(
-            f"\nInstances with non-zero scores: {(working_df['efficiency_score'] > 0).sum()}")
-        print(
-            f"Score range: {
-                working_df['efficiency_score'].min():.4f} to {
-                working_df['efficiency_score'].max():.4f}")
+        if combinations.empty:
+            return pd.DataFrame()
 
-        # Add useful metrics for display
-        working_df['memory_ratio'] = working_df['memoryGiB'] / \
-            required_memory if required_memory else 1
-        working_df['vcpu_ratio'] = working_df['vCPU'] / \
-            required_vcpus if required_vcpus else 1
-        working_df['mem_per_vcpu'] = working_df['memoryGiB'] / \
-            working_df['vCPU']
-        working_df['price_per_vcpu'] = working_df['pricePerHour'] / \
-            working_df['vCPU']
-        working_df['price_per_gib'] = working_df['pricePerHour'] / \
-            working_df['memoryGiB']
+        # Score combinations
+        combinations['final_score'] = self.score_combinations(
+            combinations,
+            weight_config
+        )
 
-        # Get top results
-        result = working_df.nlargest(top_n, 'efficiency_score')
-
-        # Print top results for debugging
-        print("\nTop instances found:")
-        for _, row in result.iterrows():
-            print(f"{row['API Name']}: score={row['efficiency_score']:.3f}, "
-                  f"mem={row['memoryGiB']}GB, vCPU={row['vCPU']}, "
-                  f"price=${row['pricePerHour']}/hr")
-
-        return result
+        # Sort by final score
+        return combinations.sort_values('final_score', ascending=False)
 
 # Create the Streamlit web app
 
@@ -551,7 +313,7 @@ def main():
                 max_nodes=max_nodes
             )
 
-            if combinations.empty:
+            if len(combinations) == 0:
                 st.warning(
                     "No valid configurations found. Try adjusting your requirements.")
                 return
@@ -562,8 +324,12 @@ def main():
                 weight_config=weight_config
             )
 
+            # Sort by final score
+            combinations = combinations.sort_values(
+                'final_score', ascending=False)
+
             # Get top recommendations
-            top_recommendations = combinations.nlargest(top_n, 'final_score')
+            top_recommendations = combinations.head(top_n)
 
             # Display results
             st.subheader("Top Recommendations")
@@ -585,6 +351,8 @@ def main():
             display_df['cpu_utilization'] = display_df['cpu_utilization'].round(
                 1).astype(str) + '%'
             display_df['final_score'] = display_df['final_score'].round(3)
+            display_df['reliability_score'] = display_df['reliability_score'].round(
+                3)
 
             st.dataframe(display_df)
 
